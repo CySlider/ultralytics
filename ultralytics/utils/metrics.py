@@ -15,7 +15,6 @@ import torch
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, TryExcept, checks, plt_settings
 from ultralytics.utils.plotting import colors as yolo_colors
 
-
 # fmt: off
 _HANDPICKED_METRIC_COLORS: tuple[tuple[float, float, float], ...] = tuple(
     np.array(
@@ -50,7 +49,6 @@ _HANDPICKED_METRIC_COLORS: tuple[tuple[float, float, float], ...] = tuple(
 
 def _get_distinct_color(index: int) -> tuple[float, float, float]:
     """Return a matplotlib-friendly RGB color with handpicked primaries before falling back to palette shifts."""
-
     if 0 <= index < len(_HANDPICKED_METRIC_COLORS):
         return _HANDPICKED_METRIC_COLORS[index]
 
@@ -64,6 +62,7 @@ def _get_distinct_color(index: int) -> tuple[float, float, float]:
             base = base * (1 - shift)
 
     return tuple((base / 255.0).clip(0.0, 1.0))
+
 
 OKS_SIGMA = (
     np.array([0.26, 0.25, 0.25, 0.35, 0.35, 0.79, 0.79, 0.72, 0.72, 0.62, 0.62, 1.07, 1.07, 0.87, 0.87, 0.89, 0.89])
