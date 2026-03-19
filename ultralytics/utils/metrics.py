@@ -13,6 +13,56 @@ import numpy as np
 import torch
 
 from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, TryExcept, checks, plt_settings
+from ultralytics.utils.plotting import colors as yolo_colors
+
+# fmt: off
+_HANDPICKED_METRIC_COLORS: tuple[tuple[float, float, float], ...] = tuple(
+    np.array(
+        [
+            (31, 119, 180),
+            (255, 127, 14),
+            (44, 160, 44),
+            (214, 39, 40),
+            (148, 103, 189),
+            (140, 86, 75),
+            (227, 119, 194),
+            (127, 127, 127),
+            (188, 189, 34),
+            (23, 190, 207),
+            (174, 199, 232),
+            (255, 187, 120),
+            (152, 223, 138),
+            (255, 152, 150),
+            (197, 176, 213),
+            (196, 156, 148),
+            (247, 182, 210),
+            (199, 199, 199),
+            (219, 219, 141),
+            (158, 218, 229),
+        ],
+        dtype=float,
+    )
+    / 255.0
+)
+# fmt: on
+
+
+def _get_distinct_color(index: int) -> tuple[float, float, float]:
+    """Return a matplotlib-friendly RGB color with handpicked primaries before falling back to palette shifts."""
+    if 0 <= index < len(_HANDPICKED_METRIC_COLORS):
+        return _HANDPICKED_METRIC_COLORS[index]
+
+    base = np.array(yolo_colors.palette[int(index) % yolo_colors.n], dtype=float)
+    cycle = int(index) // yolo_colors.n
+    if cycle:
+        shift = min(0.18 * cycle, 0.85)
+        if cycle % 2:  # lighten by mixing towards white
+            base = base + (255 - base) * shift
+        else:  # darken by scaling towards black
+            base = base * (1 - shift)
+
+    return tuple((base / 255.0).clip(0.0, 1.0))
+
 
 OKS_SIGMA = (
     np.array(
@@ -650,7 +700,13 @@ def plot_pr_curve(
 
     if 0 < len(names) < 21:  # display per-class legend if < 21 classes
         for i, y in enumerate(py.T):
-            ax.plot(px, y, linewidth=1, label=f"{names[i]} {ap[i, 0]:.3f}")  # plot(recall, precision)
+            ax.plot(
+                px,
+                y,
+                linewidth=1,
+                label=f"{names[i]} {ap[i, 0]:.3f}",
+                color=_get_distinct_color(i),
+            )  # plot(recall, precision)
     else:
         ax.plot(px, py, linewidth=1, color="gray")  # plot(recall, precision)
 
@@ -696,7 +752,7 @@ def plot_mc_curve(
 
     if 0 < len(names) < 21:  # display per-class legend if < 21 classes
         for i, y in enumerate(py):
-            ax.plot(px, y, linewidth=1, label=f"{names[i]}")  # plot(confidence, metric)
+            ax.plot(px, y, linewidth=1, label=f"{names[i]}", color=_get_distinct_color(i))  # plot(confidence, metric)
     else:
         ax.plot(px, py.T, linewidth=1, color="gray")  # plot(confidence, metric)
 
