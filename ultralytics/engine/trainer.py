@@ -381,11 +381,24 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+        self.close_mosaic_active = False
+        self.close_mosaic_pending = False
+        self.close_mosaic_remaining = 0
+        self.close_mosaic_reason = ""
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
         while True:
             self.epoch = epoch
+            if self.args.close_mosaic:
+                if self.close_mosaic_pending and not self.close_mosaic_active:
+                    self._activate_close_mosaic()
+                elif (
+                    not self.close_mosaic_active
+                    and self.args.close_mosaic > 0
+                    and epoch >= (self.epochs - self.args.close_mosaic)
+                ):
+                    self._activate_close_mosaic(reason="scheduled close-mosaic window")
             self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
@@ -395,10 +408,6 @@ class BaseTrainer:
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
             pbar = enumerate(self.train_loader)
-            # Update dataloader attributes (optional)
-            if epoch == (self.epochs - self.args.close_mosaic):
-                self._close_dataloader_mosaic()
-                self.train_loader.reset()
 
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
@@ -524,7 +533,19 @@ class BaseTrainer:
             self.nan_recovery_attempts = 0
             if RANK in {-1, 0}:
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
-                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+                stop_request = self.stopper(epoch + 1, self.fitness)
+                if (
+                    stop_request
+                    and self.args.close_mosaic
+                    and not self.close_mosaic_active
+                    and not self.close_mosaic_pending
+                ):
+                    if self._queue_close_mosaic_phase(reason="early stopping triggered"):
+                        stop_request = False
+                if not self.close_mosaic_active:
+                    self.stop |= stop_request or final_epoch
+                else:
+                    self.stop |= final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
@@ -532,6 +553,12 @@ class BaseTrainer:
                 if self.args.save or final_epoch:
                     self.save_model()
                     self.run_callbacks("on_model_save")
+
+            if self.close_mosaic_active:
+                self.close_mosaic_remaining = max(self.close_mosaic_remaining - 1, 0)
+                if self.close_mosaic_remaining == 0:
+                    self.close_mosaic_active = False
+                    self.stop = True
 
             # Scheduler
             t = time.time()
@@ -548,9 +575,16 @@ class BaseTrainer:
 
             # Early Stopping
             if RANK != -1:  # if DDP training
-                broadcast_list = [self.stop if RANK == 0 else None]
+                broadcast_list = [
+                    self.stop if RANK == 0 else None,
+                    self.close_mosaic_pending if RANK == 0 else None,
+                    self.close_mosaic_reason if RANK == 0 else None,
+                ]
                 dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
                 self.stop = broadcast_list[0]
+                if RANK != 0:
+                    self.close_mosaic_pending = bool(broadcast_list[1])
+                    self.close_mosaic_reason = broadcast_list[2] or ""
             if self.stop:
                 break  # must break all DDP ranks
             epoch += 1
@@ -954,6 +988,62 @@ class BaseTrainer:
         if hasattr(self.train_loader.dataset, "close_mosaic"):
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
+
+    def _queue_close_mosaic_phase(self, reason=""):
+        """Schedule the close-mosaic fine-tuning phase to start on the next epoch."""
+        if self.args.close_mosaic <= 0 or self.close_mosaic_active or self.close_mosaic_pending:
+            return False
+        self.close_mosaic_pending = True
+        self.close_mosaic_reason = reason or ""
+        if RANK in {-1, 0}:
+            msg = "Queueing close-mosaic fine-tuning"
+            if self.close_mosaic_reason:
+                msg += f" ({self.close_mosaic_reason})"
+            LOGGER.info(msg)
+        self.stop = False
+        return True
+
+    def _activate_close_mosaic(self, reason=None):
+        """Activate the close-mosaic phase by loading best weights and refreshing dataloaders."""
+        if self.close_mosaic_active or self.args.close_mosaic <= 0:
+            self.close_mosaic_pending = False
+            return False
+        reason = reason or self.close_mosaic_reason
+        checkpoint_path = self.best if self.best.exists() else self.last if self.last.exists() else None
+        if checkpoint_path:
+            try:
+                _, ckpt = load_checkpoint(checkpoint_path)
+            except Exception as e:
+                LOGGER.warning(f"Failed to load checkpoint '{checkpoint_path}' for close-mosaic phase: {e}")
+            else:
+                ema_model = ckpt.get("ema") or ckpt.get("model")
+                if ema_model is not None:
+                    ema_state = ema_model.float().state_dict()
+                    self._model_train()
+                    unwrap_model(self.model).load_state_dict(ema_state, strict=False)
+                    self._load_checkpoint_state(ckpt)
+                    del ema_state
+                else:
+                    LOGGER.warning(
+                        f"Checkpoint '{checkpoint_path}' does not contain model weights; continuing with current weights."
+                    )
+                del ckpt
+        else:
+            LOGGER.warning("No checkpoint available to initialize close-mosaic phase; continuing with current weights.")
+
+        self._close_dataloader_mosaic()
+        self.train_loader.reset()
+        self.close_mosaic_active = True
+        self.close_mosaic_pending = False
+        self.close_mosaic_remaining = self.args.close_mosaic
+        self.close_mosaic_reason = reason or ""
+        if RANK in {-1, 0}:
+            msg = "Starting close-mosaic fine-tuning"
+            if self.close_mosaic_reason:
+                msg += f" ({self.close_mosaic_reason})"
+            LOGGER.info(msg)
+        self.stop = False
+        return True
 
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """Construct an optimizer for the given model.
